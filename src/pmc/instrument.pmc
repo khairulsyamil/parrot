@@ -18,9 +18,7 @@ pmclass Instrument auto_attrs {
     ATTR PMC *instrumented_interp;
 
     VTABLE void init () {
-        int argc = 0;
-        char * argv[] = {NULL};
-        Parrot_Interp in;
+        struct parrot_interp_t *in;
         Parrot_Instrument_attributes * const attr =
             PMC_data_typed(SELF, Parrot_Instrument_attributes *);
         
@@ -39,10 +37,19 @@ pmclass Instrument auto_attrs {
         );
         
         /* Test run: Make it run ./try/test_interp.pir */
-        in = VTABLE_get_pointer(SELF, attr->instrumented_interp);
+        in = (struct parrot_interp_t *) VTABLE_get_pointer(INTERP, attr->instrumented_interp);
         imcc_initialize(in);
 	    imcc_start_handling_flags(in);
-        imcc_run(in, "./try/test_interp.pir", argc, argv);
+    }
+    
+    METHOD run (STRING file) {
+        int argc = 0;
+        char * argv[] = {NULL};
+        struct parrot_interp_t *in;
+        Parrot_Instrument_attributes * const attr =
+            PMC_data_typed(SELF, Parrot_Instrument_attributes *);
+        in = (struct parrot_interp_t *) VTABLE_get_pointer(INTERP, attr->instrumented_interp);
+        imcc_run(in, Parrot_str_cstring(in, file), argc, argv);
     }
 }
 
