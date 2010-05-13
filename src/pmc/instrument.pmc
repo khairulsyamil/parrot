@@ -1,0 +1,54 @@
+/* Instrument.pmc
+ *  Copyright (C) 2010, Parrot Foundation.
+ *  SVN Info
+ *     $Id$
+ *  Overview:
+ *     These are the vtable functions for the Instrument base class
+ *  Data Structure and Algorithms:
+ *  History:
+ *  Notes:
+ *     Please remove unneeded entries.
+ *  References:
+ */
+
+#include "parrot/parrot.h"
+#include "parrot/imcc.h"
+
+pmclass Instrument auto_attrs {
+    ATTR PMC *instrumented_interp;
+
+    VTABLE void init () {
+        int argc = 0;
+        char * argv[] = {NULL};
+        Parrot_Interp in;
+        Parrot_Instrument_attributes * const attr =
+            PMC_data_typed(SELF, Parrot_Instrument_attributes *);
+        
+        Parrot_io_printf(INTERP, "I AM INIT!\n");
+        
+        /* Create the interpreter PMC */
+        /*attr->instrumented_interp = Parrot_pmc_new_init(
+            INTERP, enum_class_ParrotInterpreter,
+            VTABLE_get_pmc_keyed_int(interp, interp->iglobals,IGLOBALS_INTERPRETER)
+        );
+        Keep this here for now. Over here the child interpreter does not seem to need
+        to be attached to a parent interpreter? Try on the Mac and Windows.
+        */
+        attr->instrumented_interp = Parrot_pmc_new(
+            INTERP, enum_class_ParrotInterpreter
+        );
+        
+        /* Test run: Make it run ./try/test_interp.pir */
+        in = VTABLE_get_pointer(SELF, attr->instrumented_interp);
+        imcc_initialize(in);
+	    imcc_start_handling_flags(in);
+        imcc_run(in, "./try/test_interp.pir", argc, argv);
+    }
+}
+
+/*
+ * Local Variables:
+ *   c-file-style: "parrot"
+ * End:
+ * vim: expandtab shiftwidth=4:
+ */
