@@ -13,44 +13,309 @@
 
 #include "parrot/parrot.h"
 #include "parrot/imcc.h"
+#include "parrot/runcore_api.h"
+#include "parrot/embed.h"
+
+/*
+ * Keep this struct definition here for now.
+ * TODO: Move it to its own header.
+ */
+struct instrument_runcore_t {
+    STRING                  *name;
+    int                      id;
+    oplib_init_f             opinit;
+    runcore_runops_fn_type   runops;
+    runcore_destroy_fn_type  destroy;
+    runcore_prepare_fn_type  prepare_run;
+    INTVAL                   flags;
+    
+    /* End of common members */
+    PMC                     *instruments;
+};
+typedef struct instrument_runcore_t Instrument_runcore_t;
+
+/* Helper Macros */
+#define INSTR_PMC(interp) (((Instrument_runcore_t*)interp->run_core)->instruments)
+#define INSTR_INTERP(interp) ((Parrot_Interp) VTABLE_get_pointer(interp, INSTR_PMC(interp)))
+
+/* Helper functions */
+static void TestRuncore_gatherParams(Parrot_Interp interp, opcode_t *pc, PMC *params);
+
+/*
+ * This is the simplified custom runops function.
+ * This is based on the PARROT_FAST_RUNCORE.
+ * TODO: 1. Investigate how to call instruments before and after.
+ *           (Maybe we can use yield()? )
+ *       2. Investigate scrapping this and do function pointer substitution
+ *           instead.
+ */
+
+/* TODO: Will be removing these 2 below in the next push */
+static PMC *catchall = NULL;
+static PMC *finalize = NULL;
+ 
+static
+opcode_t *
+TestRuncore_runops(Parrot_Interp interp, Parrot_runcore_t *runcore, opcode_t *pc)
+{	
+    PMC *instruments = INSTR_PMC(interp);
+    Parrot_Interp instruments_interp = INSTR_INTERP(interp);
+
+    while (pc) {
+		Parrot_pcc_set_pc(interp, CURRENT_CONTEXT(interp), pc);
+		if(catchall) {
+		     /* Call the catchall callback. First we gather the
+		        parameters of the current instruction, putting it
+		        into a ResizablePMCArray, and then pass it all to
+		        the callback. */
+		     PMC *params;
+		     
+		     /* Create the ResizablePMCArray to hold in the params */
+		     params = Parrot_pmc_new(instruments_interp, enum_class_ResizablePMCArray);   
+		     
+		     /* Gather the params */
+		     TestRuncore_gatherParams(interp, pc, params);
+		     
+		     /*
+		      * TODO: Create a ResizableStringArray for all the various opcode names.
+		      *       This is not a feasible solution, as each iteration will create a
+		      *       new string. BLEARGH!
+		      */
+			 Parrot_ext_call(instruments_interp, catchall, "SP->",
+			    Parrot_str_new(
+				    instruments_interp,
+				    interp->op_info_table[*pc].full_name,
+				    0
+			    ),
+			    params
+			 );
+		}
+        DO_OP(pc, interp);
+    }
+	
+    return pc;
+	
+}
+
+static
+void
+TestRuncore_init (Parrot_Interp interp, PMC *instrument) {
+	Instrument_runcore_t * const coredata = mem_gc_allocate_zeroed_typed(interp, Instrument_runcore_t);
+	
+	/* Ensure the current loaded runcore is the slow core */
+	Parrot_set_run_core(interp, PARROT_SLOW_CORE);
+	
+	/* Copy the runcore entry for the PARROT_SLOW_CORE,
+	   and then make modifications to it.
+	   Copy so that we get the opinit function pointer.
+	*/
+	mem_copy_n_typed(coredata, interp->run_core, 1, Parrot_runcore_t);
+	
+	coredata->name			= string_from_literal(interp, "TestRuncore");
+	coredata->runops		= TestRuncore_runops;
+	coredata->prepare_run	= NULL;
+	coredata->destroy		= NULL;
+	coredata->flags			= 0;
+	coredata->instruments   = instrument;
+	
+	PARROT_RUNCORE_FUNC_TABLE_SET((Parrot_runcore_t *)coredata);
+	
+	Parrot_runcore_register(interp, (Parrot_runcore_t *) coredata);
+	
+	//Set this runcore as to be the one running the show.
+	Parrot_runcore_switch(interp, coredata->name);
+}
+
 
 pmclass Instrument auto_attrs {
     ATTR PMC *instrumented_interp;
+    ATTR Parrot_Interp instrumenter_interp;
 
     VTABLE void init () {
         struct parrot_interp_t *in;
-        Parrot_Instrument_attributes * const attr =
-            PMC_data_typed(SELF, Parrot_Instrument_attributes *);
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
         
-        Parrot_io_printf(INTERP, "I AM INIT!\n");
-        
-        /* Create the interpreter PMC */
-        /*attr->instrumented_interp = Parrot_pmc_new_init(
-            INTERP, enum_class_ParrotInterpreter,
-            VTABLE_get_pmc_keyed_int(interp, interp->iglobals,IGLOBALS_INTERPRETER)
-        );
-        Keep this here for now. Over here the child interpreter does not seem to need
-        to be attached to a parent interpreter? Try on the Mac and Windows.
-        */
+        /* Create the child interpreter PMC */
         attr->instrumented_interp = Parrot_pmc_new(
             INTERP, enum_class_ParrotInterpreter
         );
+        attr->instrumenter_interp = INTERP;
         
-        /* Test run: Make it run ./try/test_interp.pir */
-        in = (struct parrot_interp_t *) VTABLE_get_pointer(INTERP, attr->instrumented_interp);
+        /* Initialize imcc for the child interpreter */
+        in = (struct parrot_interp_t *)
+                VTABLE_get_pointer(INTERP, attr->instrumented_interp);
+                
+        TestRuncore_init(in, SELF);
         imcc_initialize(in);
 	    imcc_start_handling_flags(in);
     }
     
-    METHOD run (STRING file) {
+    VTABLE void * get_pointer () {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        return attr->instrumenter_interp;
+    }
+    
+    METHOD run (STRING file, PMC *args) {
         int argc = 0;
-        char * argv[] = {NULL};
+        char * default_argv[] = {NULL};
+        char ** argv = default_argv;
         struct parrot_interp_t *in;
-        Parrot_Instrument_attributes * const attr =
-            PMC_data_typed(SELF, Parrot_Instrument_attributes *);
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+            
+        /* If args is not null, is of type ResizableStringArray and has at
+           least 1 element, process it so we can pass it to the child interpreter.
+           TODO: Investigate how to get the type of args. Apparently it's not
+                 Parrot_pmc_get_type
+         */
+        if(!Parrot_pmc_is_null(INTERP, args)
+           && VTABLE_get_integer(INTERP, args) > 0) {
+            /* There are some arguments to be passed to
+               the child interpreter. We need to convert
+               them from Parrot strings to c-strings so
+               that we can pass it to imcc.
+            */
+            
+            /* Get the number of argument values */
+            int count = VTABLE_get_integer(INTERP, args);
+            
+            /* Allocate enough memory for the argv pointer array */
+            argv = (char **) mem_internal_allocate(sizeof(char *) * count);
+            
+            /* Populate the argv array, updating argc in the process */
+            for(argc = 0; argc < count; argc++) {
+                STRING *cur;
+                
+                cur = VTABLE_get_string_keyed_int(INTERP, args, argc);
+                argv[argc] = Parrot_str_to_cstring(INTERP, cur);
+            }
+        }
+        
+        /* Begin Execution */
         in = (struct parrot_interp_t *) VTABLE_get_pointer(INTERP, attr->instrumented_interp);
         imcc_run(in, Parrot_str_cstring(in, file), argc, argv);
+        
+        /* Finalize the instruments */
+        Parrot_ext_call(INTERP, finalize, "->");
+        
+        /* We should free the cstrings allocated above if needed */
+        if(argc > 0) {
+            for(; argc > 0; argc--) {
+                Parrot_str_free_cstring(argv[argc - 1]);
+                argv[argc - 1] = NULL;
+            }
+            
+            /* Free the memory allocated to hold the string pointers */
+            mem_internal_free(argv);
+            argv = NULL;
+        }
     }
+    
+    METHOD attach (STRING layer, STRING param1, STRING callback) {
+        PMC *sub;  
+        /* Dispatch to the various handlers depending on what is required */
+        
+        /* Since we are only prototyping ops and catchall, just do the prototyping here
+           first and modularise later */
+        /* Assume layer == ops and param1 == catchall */
+        
+        /* Look for the callback sub pmc */
+        sub = Parrot_find_global_cur(INTERP, callback);
+        catchall = sub;
+    }
+    
+    METHOD finalize (STRING callback) {
+        PMC *sub;
+        sub = Parrot_find_global_cur(INTERP, callback);
+        finalize = sub;
+    }
+}
+
+/*
+ * Helper function to gather the parameters of an op
+ * and put it into the passed in ResizablePMCArray.
+ */
+static
+void
+TestRuncore_gatherParams(Parrot_Interp interp, opcode_t *pc, PMC *params) {
+    INTVAL no_params, cur_param;
+    PMC *cc; /* Current context */
+    Parrot_Interp instr_in = INSTR_INTERP(interp);
+    
+    /* Retrieve the current context.
+       Current context refers to the registers + some other stuff */
+    cc = CURRENT_CONTEXT(interp); /* defined in parrot/interpreter.h */
+    
+    /* Figure out how many parameters the op takes,
+        referring to op_info_table
+        We want the op_count field of the current op's
+        op_info_t, which also includes the op as a parameter. */
+    no_params = interp->op_info_table[*pc].op_count - 1;
+     
+    /* Begin gathering the parameters.
+       Each parameter is of a certain type, and based on this
+       type, we can access the current_context and get the
+       parameter.
+       
+       The types are listed in parrot/op.h.
+    */
+    for(cur_param = 0; cur_param < no_params; cur_param++) {
+        arg_type_t type; /* parrot/op.h */
+        
+        /* Get the type of the current param */
+        type = interp->op_info_table[*pc].types[cur_param];
+        
+        /* For keyed types, remove the keyed flag,
+           instead treating it as a normal ARG type. */
+        if((type & PARROT_ARG_KEYED) == PARROT_ARG_KEYED) {
+            type &= ~PARROT_ARG_KEYED;
+        }
+        
+        /* Gather the params and put it into the
+           ResizablePMCArray pointed to by params.
+         */
+        switch(type) {
+            case PARROT_ARG_IC:            
+                /* Integer constants are stored as part of the opcode
+                   in the packfile */
+                VTABLE_push_integer(instr_in, params, pc[cur_param + 1]);
+                
+                break;
+            case PARROT_ARG_I:
+                VTABLE_push_integer(instr_in, params,
+                                    *Parrot_pcc_get_INTVAL_reg(interp, cc, pc[cur_param + 1]));
+                break;
+            case PARROT_ARG_NC:
+                VTABLE_push_float(instr_in, params,
+                                  Parrot_pcc_get_num_constant_func(interp, cc, pc[cur_param + 1]));
+                
+                break;
+            case PARROT_ARG_N:
+                VTABLE_push_float(instr_in, params,
+                                  *Parrot_pcc_get_FLOATVAL_reg(interp, cc, pc[cur_param + 1]));
+                break;
+            case PARROT_ARG_PC:
+                VTABLE_push_pmc(instr_in, params,
+                                  Parrot_pcc_get_pmc_constant_func(interp, cc, pc[cur_param + 1]));
+                
+                break;
+            case PARROT_ARG_P:
+                VTABLE_push_pmc(instr_in, params,
+                                  *Parrot_pcc_get_PMC_reg(interp, cc, pc[cur_param + 1]));
+                break;
+            case PARROT_ARG_SC:
+                VTABLE_push_string(instr_in, params,
+                                  Parrot_pcc_get_string_constant_func(interp, cc, pc[cur_param + 1]));
+                
+                break;
+            case PARROT_ARG_S:
+                VTABLE_push_string(instr_in, params,
+                                  *Parrot_pcc_get_STRING_reg(interp, cc, pc[cur_param + 1]));
+                break;
+            default:
+                /* printf("\tUnhandled arg type: %d\n", type); */
+                break;
+        };
+     }
 }
 
 /*
